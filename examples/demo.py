@@ -31,6 +31,7 @@ except ImportError:  # pragma: no cover
 sys.path.insert(0, str(Path(__file__).parent))
 from cameras import (  # noqa: E402  (intentional after sys.path tweak)
     basler_ace_aca1300_200um,
+    kaya_iron_2020bsi,
     kaya_iron_cxp_253,
     phantom_miro_c211,
 )
@@ -66,11 +67,12 @@ def main() -> None:
 
     presets = [
         ("KAYA Iron CXP 253", kaya_iron_cxp_253()),
+        ("KAYA Iron 2020BSI", kaya_iron_2020bsi()),
         ("Phantom Miro C211", phantom_miro_c211()),
         ("Basler ace acA1300-200um", basler_ace_aca1300_200um()),
     ]
 
-    fig, axes = plt.subplots(1, len(presets), figsize=(4.5 * len(presets), 4.6))
+    fig, axes = plt.subplots(1, len(presets), figsize=(4.2 * len(presets), 4.6))
     for ax, (name, cam) in zip(axes, presets):
         adu = cam.expose(mean_e)
         im = ax.imshow(adu, cmap="gray")
@@ -83,7 +85,10 @@ def main() -> None:
         ax.axis("off")
         fig.colorbar(im, ax=ax, fraction=0.046, label="ADU")
 
-    fig.suptitle("Same scene through three real cameras", fontsize=12)
+    fig.suptitle(
+        f"Same scene through {len(presets)} real cameras",
+        fontsize=12,
+    )
     fig.tight_layout()
     out = OUT_DIR / "comparison.png"
     fig.savefig(out, dpi=140)
