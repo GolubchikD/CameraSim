@@ -31,6 +31,21 @@ from scipy.signal import fftconvolve
 from . import _backend
 
 
+def _bin_frames(f: np.ndarray, factor: int) -> np.ndarray:
+    """Flux-conserving N×N down-bin of a ``(N, H, W)`` stack (sum per block).
+
+    The frame is cropped to a whole multiple of ``factor`` before binning.
+    """
+    if factor <= 1:
+        return f
+    n, h, w = f.shape
+    h2, w2 = (h // factor) * factor, (w // factor) * factor
+    if h2 == 0 or w2 == 0:
+        return f
+    f = f[:, :h2, :w2]
+    return f.reshape(n, h2 // factor, factor, w2 // factor, factor).sum(axis=(2, 4))
+
+
 @dataclass
 class DetectorModel:
     """Camera / detector model. All noise sources are independent.
@@ -68,6 +83,23 @@ class DetectorModel:
         Fraction of pixels with stuck readout. Hot pixels are clamped to
         full-well in the electron domain (saturate at the ADC ceiling).
         Dead pixels read ``bias_adu`` after the bias step.
+    sim_pixel_m, camera_pixel_m : float or None
+        Simulation-grid pitch and physical detector pixel pitch, in metres.
+        When ``camera_pixel_m > sim_pixel_m`` the input frame is binned
+        (flux-conserving N×N sum) by ``round(camera_pixel_m / sim_pixel_m)``
+        as the FIRST step, before the detector chain — so a fine wave-optics
+        grid is integrated onto the coarser physical detector pixel. The
+        detector maps (PRNU/DSNU/bad pixels) are built at the binned size.
+    bin_factor : int
+        Explicit N×N bin factor; overrides the pixel-size ratio when > 1.
+    apply_noise : bool
+        When False, skip ALL stochastic / fixed-pattern steps (PRNU, Poisson
+        shot, DSNU, read noise, hot/dead pixels): a deterministic "ideal"
+        sensor. Used by closed-loop wavefront sensors that want binning
+        without injecting noise into the control loop.
+    quantize : bool
+        When False, skip the gain + bias + ADC step and return the float
+        electron map instead of integer ADU.
     rng_seed : int or None
         Seed for ALL stochastic processes. Internally split into two
         independent streams: one for the static detector maps
@@ -89,6 +121,11 @@ class DetectorModel:
     bias_adu: float = 25.0
     hot_pixel_fraction: float = 1e-4
     dead_pixel_fraction: float = 1e-4
+    sim_pixel_m: float | None = None
+    camera_pixel_m: float | None = None
+    bin_factor: int = 1
+    apply_noise: bool = True
+    quantize: bool = True
     rng_seed: int | None = 0
 
     _prnu_map: np.ndarray | None = field(default=None, init=False, repr=False)
@@ -98,6 +135,20 @@ class DetectorModel:
     _frame_seed: np.random.SeedSequence | None = field(
         default=None, init=False, repr=False
     )
+
+    # ---- sim -> camera-pixel binning --------------------------------------
+
+    def _binning_factor(self) -> int:
+        """Integer N×N bin factor from ``bin_factor`` or the pixel-size ratio."""
+        if self.bin_factor and self.bin_factor > 1:
+            return int(self.bin_factor)
+        if (
+            self.sim_pixel_m
+            and self.camera_pixel_m
+            and self.camera_pixel_m > self.sim_pixel_m
+        ):
+            return max(1, int(round(self.camera_pixel_m / self.sim_pixel_m)))
+        return 1
 
     # ---- detector-map setup ------------------------------------------------
 
@@ -201,6 +252,12 @@ class DetectorModel:
                 f"{scene_arr.ndim}-D shape {scene_arr.shape}."
             )
 
+        # -1. Sim -> camera-pixel binning (flux-conserving). Done first so the
+        # whole chain (maps, PSF, noise) runs at the physical detector size.
+        bin_factor = self._binning_factor()
+        if bin_factor > 1:
+            scene_arr = _bin_frames(scene_arr.astype(np.float64, copy=False), bin_factor)
+
         frame_shape = scene_arr.shape[1:]
         self._ensure_maps(frame_shape)
         # Fresh per-call RNG -- repeated expose() calls on the same Camera
@@ -243,27 +300,31 @@ class DetectorModel:
         # 2-3. Sky background + mean dark current.
         f = f + self.background_e + self.dark_current_e
 
-        # 4. PRNU multiplies the full incident charge.
-        f = f * self._prnu_map
-
-        # 5. Poisson shot noise on the total mean.
-        f = rng.poisson(np.maximum(f, 0.0)).astype(np.float64)
-
-        # 6. DSNU: additive frozen per-pixel offset.
-        f = f + self._dsnu_map
-
-        # 7. Read noise (Gaussian, IID per pixel per frame).
-        if self.read_noise_e > 0:
-            f = f + rng.normal(0.0, self.read_noise_e, size=f.shape)
-
-        # 8. Hot/dead pixel clamps (electron domain).
-        f = np.where(self._hot_mask, self.full_well_e, f)
-        f = np.where(self._dead_mask, 0.0, f)
+        # 4-8. Fixed-pattern + stochastic detector effects. Skipped wholesale in
+        # the deterministic "ideal" mode (apply_noise=False) so a closed-loop
+        # WFS gets binning without noise injected into the control loop.
+        if self.apply_noise:
+            # 4. PRNU multiplies the full incident charge.
+            f = f * self._prnu_map
+            # 5. Poisson shot noise on the total mean.
+            f = rng.poisson(np.maximum(f, 0.0)).astype(np.float64)
+            # 6. DSNU: additive frozen per-pixel offset.
+            f = f + self._dsnu_map
+            # 7. Read noise (Gaussian, IID per pixel per frame).
+            if self.read_noise_e > 0:
+                f = f + rng.normal(0.0, self.read_noise_e, size=f.shape)
+            # 8. Hot/dead pixel clamps (electron domain).
+            f = np.where(self._hot_mask, self.full_well_e, f)
+            f = np.where(self._dead_mask, 0.0, f)
 
         # 9. Full-well clip.
         f = np.minimum(f, self.full_well_e)
 
-        # 10. Gain + bias + ADC quantisation.
+        # 10. Gain + bias + ADC quantisation. Skipped when quantize=False, which
+        # returns the float electron map (what a wavefront reconstructor wants).
+        if not self.quantize:
+            return _backend.from_numpy(f[0] if single else f, meta)
+
         adu = np.round(f / self.gain_e_per_adu + self.bias_adu)
         adu = np.clip(adu, 0, 2 ** self.bits - 1)
         adu = adu.astype(np.uint16 if self.bits <= 16 else np.uint32)

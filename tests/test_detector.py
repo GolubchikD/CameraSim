@@ -248,3 +248,51 @@ def test_torch_and_numpy_agree():
     out_np = cam_np.expose(img)
     out_t = cam_t.expose(torch.from_numpy(img.copy())).cpu().numpy()
     np.testing.assert_array_equal(out_np, out_t)
+
+
+# --- sim -> camera-pixel binning + ideal / float modes ----------------------
+
+
+def test_bin_factor_is_flux_conserving():
+    """An N×N down-bin sums each block; total flux is preserved."""
+    cam = DetectorModel(bin_factor=2, apply_noise=False, quantize=False,
+                        background_e=0.0, dark_current_e=0.0, psf_sigma_px=0.0,
+                        full_well_e=float("inf"))
+    out = cam.expose(np.ones((64, 64)))
+    assert out.shape == (32, 32)
+    assert np.allclose(out, 4.0)
+
+
+def test_pixel_size_ratio_sets_binning():
+    """camera_pixel_m / sim_pixel_m rounds to the bin factor."""
+    cam = DetectorModel(sim_pixel_m=1e-3, camera_pixel_m=4e-3, apply_noise=False,
+                        quantize=False, background_e=0.0, dark_current_e=0.0,
+                        psf_sigma_px=0.0, full_well_e=float("inf"))
+    out = cam.expose(np.ones((64, 64)))
+    assert out.shape == (16, 16)
+
+
+def test_ideal_mode_is_exact_identity():
+    """apply_noise=False + quantize=False with no pedestals returns the input."""
+    x = np.arange(32 * 32, dtype=np.float64).reshape(32, 32)
+    cam = DetectorModel(apply_noise=False, quantize=False, background_e=0.0,
+                        dark_current_e=0.0, psf_sigma_px=0.0, full_well_e=float("inf"))
+    out = cam.expose(x)
+    assert out.dtype == np.float64
+    assert np.array_equal(out, x)
+
+
+def test_quantize_false_returns_float_electrons():
+    """quantize=False returns a float map, not integer ADU."""
+    cam = DetectorModel(apply_noise=True, quantize=False, rng_seed=0)
+    out = cam.expose(_flat_input((16, 16), 100.0))
+    assert np.issubdtype(out.dtype, np.floating)
+
+
+def test_defaults_unchanged_by_new_fields():
+    """The default pipeline (noise + quantize on, no binning) is unchanged."""
+    a = DetectorModel(rng_seed=0).expose(_flat_input((24, 24), 300.0))
+    b = DetectorModel(rng_seed=0).expose(_flat_input((24, 24), 300.0))
+    assert a.shape == (24, 24)
+    assert np.issubdtype(a.dtype, np.integer)
+    assert np.array_equal(a, b)
