@@ -296,3 +296,30 @@ def test_defaults_unchanged_by_new_fields():
     assert a.shape == (24, 24)
     assert np.issubdtype(a.dtype, np.integer)
     assert np.array_equal(a, b)
+
+
+def test_reseed_varies_frames_reproducibly():
+    """reseed(): distinct per-frame noise, reproducible across runs, static
+    maps untouched (the frame-sequence contract twin cameras need)."""
+    def _grab_pair(base_seed):
+        cam = DetectorModel(rng_seed=base_seed, prnu_sigma=0.02, dsnu_sigma_e=0.5)
+        frames = []
+        for frame_id in range(2):
+            cam.reseed(base_seed + frame_id)
+            frames.append(cam.expose(_flat_input((16, 16), 500.0)))
+        return frames, cam._prnu_map.copy()
+
+    (f0, f1), prnu_a = _grab_pair(7)
+    (g0, g1), prnu_b = _grab_pair(7)
+    assert not np.array_equal(f0, f1)  # frames differ within a run
+    assert np.array_equal(f0, g0) and np.array_equal(f1, g1)  # runs reproduce
+    assert np.array_equal(prnu_a, prnu_b)  # static maps stable
+
+
+def test_reseed_before_first_expose_is_equivalent_to_construction_seed():
+    cam_a = DetectorModel(rng_seed=999)
+    cam_a.reseed(3)
+    cam_b = DetectorModel(rng_seed=3)
+    a = cam_a.expose(_flat_input((12, 12), 200.0))
+    b = cam_b.expose(_flat_input((12, 12), 200.0))
+    assert np.array_equal(a, b)

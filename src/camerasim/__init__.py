@@ -5,4 +5,4 @@ from camerasim.detector import DetectorModel
 from camerasim.photometry import electrons_from_intensity
 
 __all__ = ["DetectorModel", "electrons_from_intensity", "psf"]
-__version__ = "0.1.0"
+__version__ = "0.2.0"

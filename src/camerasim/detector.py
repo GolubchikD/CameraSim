@@ -185,6 +185,26 @@ class DetectorModel:
         self._hot_mask = hot.reshape(shape)
         self._dead_mask = dead.reshape(shape)
 
+    # ---- per-frame noise stream control -------------------------------------
+
+    def reseed(self, seed: int | None) -> None:
+        """Reset the per-frame noise stream without touching the static maps.
+
+        By default repeated :meth:`expose` calls reproduce the SAME noise
+        draw (the frame stream re-seeds per call) — right for "give me that
+        exact frame again", wrong for a camera simulation grabbing a
+        SEQUENCE of frames whose noise must differ frame-to-frame yet stay
+        reproducible run-to-run. Callers doing the latter derive a per-frame
+        seed (e.g. ``base_seed + frame_id``) and call ``reseed`` before each
+        :meth:`expose`. PRNU/DSNU/hot/dead maps are static hardware and are
+        deliberately NOT redrawn (they keep the seed they were built with).
+        """
+        self.rng_seed = seed
+        if self._prnu_map is not None:
+            # Maps already built: replace only the frame stream. Mirrors the
+            # spawn(2) split in _ensure_maps (index 1 = the frame stream).
+            self._frame_seed = np.random.SeedSequence(seed).spawn(2)[1]
+
     # ---- PSF ---------------------------------------------------------------
 
     def _apply_psf(self, f: np.ndarray) -> np.ndarray:
